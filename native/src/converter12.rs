@@ -19,7 +19,7 @@
 //!
 //! | | `Preprocessor12` | `Converter12` |
 //! | --- | --- | --- |
-//! | Sampling | nearest (`Load`) | nearest **or** bilinear (`SampleLevel`) |
+//! | Sampling | nearest (`Load`) | nearest, bilinear (`SampleLevel`) **or** area |
 //! | Output | FP32 NCHW | FP32 NCHW, **FP16 NCHW**, **BGRA8 NHWC**, **NV12**, **P010** |
 //! | Root signature | `NumStaticSamplers: 0` | one static linear sampler |
 //!
@@ -110,6 +110,26 @@ pub enum Sampling {
     /// four nearest texels, which is what desktop content — small text, thin
     /// borders — needs to survive a 4× reduction.
     Bilinear,
+    /// Box filter over the exact source area each output pixel covers — what
+    /// `cv2.INTER_AREA` does on reduction. Bilinear reads a fixed 2×2 whatever
+    /// the ratio, so at non-integer reductions (384×512 → 288×384 is 4:3) its
+    /// weights cycle from pixel to pixel and sharpness beats across the image;
+    /// past 2× it skips texels outright. Area weights every covered texel by its
+    /// overlap, so nothing is skipped and nothing aliases.
+    ///
+    /// Reduction only: an axis where the crop is smaller than the output falls
+    /// back to bilinear for that region, as OpenCV does when enlarging.
+    Area,
+}
+
+impl Sampling {
+    fn define(self) -> u32 {
+        match self {
+            Sampling::Nearest => 0,
+            Sampling::Bilinear => 1,
+            Sampling::Area => 2,
+        }
+    }
 }
 
 /// What the converter writes.
@@ -237,12 +257,8 @@ StructuredBuffer<Rect> Regions : register(t1);
 // and every kernel sets it before its first fetch.
 static Rect g_crop;
 
-// The hardware swizzles BGRA formats, so .x is RED here despite blue being
-// first in memory. Getting this backwards produces BGR labelled RGB, which no
-// test of speed or shape would catch.
-float4 fetch(uint x, uint y)
+float4 fetch_bilinear(uint x, uint y)
 {
-#if SAMPLING == 1
     // Output pixel x covers crop range [x*C/O, (x+1)*C/O]; its centre is
     // crop.x + (x+0.5)*C/O texels.
     float2 origin = float2(g_crop.x, g_crop.y);
@@ -255,6 +271,64 @@ float4 fetch(uint x, uint y)
     // resize with clamp-to-edge", which is what a crop means.
     pos = clamp(pos, origin + 0.5f, origin + extent - 0.5f);
     return Source.SampleLevel(LinearSampler, pos / float2(SrcWidth, SrcHeight), 0.0f);
+}
+
+#if SAMPLING == 2
+// Area: the mean of the crop texels output pixel (x, y) covers, each weighted
+// by how much of it is covered.
+//
+// Per axis, scaled by O so every boundary is an integer: output pixel x spans
+// [x*C, (x+1)*C) and texel i spans [i*O, (i+1)*O). Their overlap is texel i's
+// weight, and the weights of one output pixel sum to exactly C. Integer
+// arithmetic keeps the boundaries exact -- in floats, x*C/O drifts and a
+// texel on a boundary picks up a sliver of weight it should not have.
+// x*C < O*C stays far below 2^32 at any surface D3D can create.
+//
+// The weights are normalised before they touch a texel, so an identity-size
+// axis multiplies by exactly 1.0 and reproduces the captured value bit for bit.
+float4 fetch_area(uint x, uint y)
+{
+    uint ax = x * g_crop.w;
+    uint bx = ax + g_crop.w;
+    uint ay = y * g_crop.h;
+    uint by = ay + g_crop.h;
+    uint i0 = ax / OutWidth;
+    uint i1 = (bx - 1) / OutWidth;
+    uint j0 = ay / OutHeight;
+    uint j1 = (by - 1) / OutHeight;
+    float inv_w = 1.0f / (float)g_crop.w;
+    float inv_h = 1.0f / (float)g_crop.h;
+
+    float4 sum = 0.0f;
+    for (uint j = j0; j <= j1; ++j)
+    {
+        float wy = (float)(min((j + 1) * OutHeight, by) - max(j * OutHeight, ay)) * inv_h;
+        float4 row = 0.0f;
+        for (uint i = i0; i <= i1; ++i)
+        {
+            float wx = (float)(min((i + 1) * OutWidth, bx) - max(i * OutWidth, ax)) * inv_w;
+            row += wx * Source.Load(int3(g_crop.x + i, g_crop.y + j, 0));
+        }
+        sum += wy * row;
+    }
+    return sum;
+}
+#endif
+
+// The hardware swizzles BGRA formats, so .x is RED here despite blue being
+// first in memory. Getting this backwards produces BGR labelled RGB, which no
+// test of speed or shape would catch.
+float4 fetch(uint x, uint y)
+{
+#if SAMPLING == 2
+    // Area is a reduction filter. Enlarging along either axis -- a crop smaller
+    // than the output -- goes to bilinear, as cv2.INTER_AREA does. Uniform per
+    // region, so the branch never diverges within a slot.
+    if (g_crop.w < OutWidth || g_crop.h < OutHeight)
+        return fetch_bilinear(x, y);
+    return fetch_area(x, y);
+#elif SAMPLING == 1
+    return fetch_bilinear(x, y);
 #else
     uint sx = g_crop.x + ((g_crop.w == OutWidth ) ? x : (x * g_crop.w / OutWidth ));
     uint sy = g_crop.y + ((g_crop.h == OutHeight) ? y : (y * g_crop.h / OutHeight));
@@ -527,7 +601,7 @@ fn compile_variant(
     // FFI: same result, no CString lifetimes to get wrong.
     let source = format!(
         "#define SAMPLING {}\n#define OUTPUT {}\n#define MATRIX {}\n#define FULL_RANGE {}\n{}",
-        if sampling == Sampling::Bilinear { 1 } else { 0 },
+        sampling.define(),
         output.define(),
         if yuv.matrix == Matrix::Bt601 { 1 } else { 0 },
         if yuv.full_range { 1 } else { 0 },

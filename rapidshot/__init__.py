@@ -48,6 +48,7 @@ from rapidshot.preprocess import to_nchw
 try:
     from rapidshot.converter import (
         GpuConverter, GpuTensor, TensorTransfer, CrossAdapterRequired,
+        capture_size,
     )
     from rapidshot.tensor_stream import TensorStream
 except Exception:  # pragma: no cover - only when the extension is absent
@@ -55,6 +56,7 @@ except Exception:  # pragma: no cover - only when the extension is absent
     GpuTensor = None
     TensorTransfer = None
     CrossAdapterRequired = None
+    capture_size = None
     TensorStream = None
 
 try:
@@ -76,7 +78,7 @@ __all__ = [
     "probe_topology", "GpuTopology", "AdapterInfo",
     "to_nchw",
     "GpuConverter", "GpuTensor", "TensorTransfer", "CrossAdapterRequired",
-    "TensorStream", "HdrClippedWarning",
+    "capture_size", "TensorStream", "HdrClippedWarning",
 ]
 
 class RapidshotError(Exception):

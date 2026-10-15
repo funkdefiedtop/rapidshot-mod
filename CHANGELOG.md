@@ -10,6 +10,28 @@ each release can be traced back to the plan it implements.
 
 ## [Unreleased]
 
+### Added
+
+- **`sampling="area"` for `GpuConverter`** (needs a native build from this
+  tree). Each output pixel is the overlap-weighted mean of the texels it
+  covers, which is what `cv2.INTER_AREA` computes on reduction -- pinned to it
+  within one code by `tests/test_gpu_converter_area.py`. Bilinear reads a fixed
+  2x2 at any ratio, so at a 4:3 reduction its weights cycle pixel to pixel and
+  past 2x it skips texels. Enlarging falls back to bilinear, as OpenCV does.
+  384x512 -> 288x384 FP16 on an RTX 3080: 0.083 ms against bilinear's 0.076.
+- **`capture_scale` for `GpuConverter` and `TensorStream`.** Captures a region
+  about `capture_scale` times the output size, centred on the frame, and
+  reduces it to the model input. The region keeps the output's aspect ratio
+  exactly and both sides are multiples of `capture_align` (default 32), so the
+  scale is rounded *up* to the next one where that holds: for 288x384 the
+  regions are 96k x 128k, and `capture_scale=1.3` captures 384x512 and then
+  reads 4/3. Settable between frames. `capture_region` reports the region the
+  last call converted and `to_frame(x, y)` maps output coordinates back to the
+  frame. A scale below 1.0, or a region that does not fit the frame, is refused
+  rather than clamped.
+- **`rapidshot.capture_size(size, scale, align=32)`**, the rounding above as a
+  function, so a dataset script crops exactly the region inference captures.
+
 ## [2.6.3] - 2026-09-30
 
 ### Fixed

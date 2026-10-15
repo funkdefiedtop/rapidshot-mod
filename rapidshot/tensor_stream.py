@@ -71,9 +71,11 @@ class TensorStream:
             ``True``). A no-op until the tensor has been exported to CUDA.
             Turn off only when you synchronise yourself.
         **options: passed to :class:`GpuConverter` — ``dtype``, ``layout``,
-            ``sampling``, ``normalize``, ``bgr``, ``crop``, ``batch``,
-            ``pixel_format``, ``matrix``, ``full_range``. ``batch`` defaults
-            to ``len(regions)``.
+            ``sampling``, ``normalize``, ``bgr``, ``crop``, ``capture_scale``,
+            ``capture_align``, ``batch``, ``pixel_format``, ``matrix``,
+            ``full_range``. ``batch``
+            defaults to ``len(regions)``. ``capture_scale`` is also settable
+            between iterations via :attr:`capture_scale`.
 
     Each yielded :class:`GpuTensor` is valid until the next iteration. It is the
     same object every time — unless the converter had to be rebuilt, which
@@ -213,6 +215,46 @@ class TensorStream:
         """The converter, or ``None`` before the first frame — it is built from
         a live frame, which picks the adapter."""
         return self._converter
+
+    @property
+    def capture_scale(self) -> Optional[float]:
+        """Captured region over output size *as applied* -- rounded up to the
+        exact ratio and ``capture_align``; see :func:`rapidshot.capture_size`.
+        ``None`` when not in use."""
+        size = self.capture_size
+        return None if size is None else size[0] / self._size[0]
+
+    @capture_scale.setter
+    def capture_scale(self, value: Optional[float]) -> None:
+        # Validated now, so a bad value fails at the assignment rather than on
+        # the next frame, and kept in the options so a rebuilt converter has it.
+        if value is not None:
+            _converter.capture_size(self._size, value, self._options.get("capture_align", 32))
+        if self._converter is not None:
+            self._converter.capture_scale = value
+        self._options.pop("crop", None)
+        self._options["capture_scale"] = value
+
+    @property
+    def capture_size(self) -> Optional[Tuple[int, int]]:
+        """``(width, height)`` of the ``capture_scale`` region, or ``None``."""
+        scale = self._options.get("capture_scale")
+        if scale is None:
+            return None
+        return _converter.capture_size(self._size, scale, self._options.get("capture_align", 32))
+
+    @property
+    def capture_region(self) -> Optional[Tuple[int, int, int, int]]:
+        """Frame-coordinate region behind the latest tensor; see
+        :attr:`GpuConverter.capture_region`."""
+        return None if self._converter is None else self._converter.capture_region
+
+    def to_frame(self, x: float, y: float) -> Tuple[float, float]:
+        """Map a point in the latest tensor to frame coordinates; see
+        :meth:`GpuConverter.to_frame`."""
+        if self._converter is None:
+            raise RuntimeError("no tensor yet: iterate the stream first")
+        return self._converter.to_frame(x, y)
 
     @property
     def frame(self):

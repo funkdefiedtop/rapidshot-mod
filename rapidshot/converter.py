@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import math
 from typing import Optional, Sequence, Tuple
 import weakref
 
@@ -37,7 +38,7 @@ from . import native
 # needs it for the same reason and must not drift from this path.
 from .native import _texture_crop, _validate_crop
 
-__all__ = ["GpuConverter", "GpuTensor", "TensorTransfer", "CrossAdapterRequired"]
+__all__ = ["GpuConverter", "GpuTensor", "TensorTransfer", "CrossAdapterRequired", "capture_size"]
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,59 @@ _DTYPE_BYTES = {"float32": 4, "float16": 2, "uint8": 1}
 _ITEMSIZE = dict(_DTYPE_BYTES, uint16=2)
 _PIXEL_FORMATS = ("nv12", "p010")
 _MATRICES = ("bt709", "bt601")
+
+
+def _validate_scale(scale) -> float:
+    """A capture scale as a float: finite and at least 1.0."""
+    try:
+        value = float(scale)
+    except (TypeError, ValueError):
+        raise ValueError(f"capture_scale must be a number, got {scale!r}") from None
+    if isinstance(scale, bool) or not value >= 1.0 or value == float("inf"):
+        raise ValueError(
+            f"capture_scale must be at least 1.0 (the region is reduced to the "
+            f"output, never enlarged), got {scale!r}"
+        )
+    return value
+
+
+def capture_size(size: Tuple[int, int], scale: float, align: int = 32) -> Tuple[int, int]:
+    """The ``(width, height)`` captured for an output *size* at *scale*.
+
+    The smallest region at least *scale* times *size* whose aspect ratio is
+    **exactly** the output's and whose sides are both multiples of *align*.
+    The scale is rounded *up* to the next one that allows that, never down, so
+    the region is never smaller than asked for. For ``size=(288, 384)`` and the
+    default ``align=32`` the regions are 96k x 128k -- scales 1, 4/3, 5/3, 2,
+    ... -- so ``1.3`` gives 384x512 and ``1.34`` gives 480x640. Steps are
+    finer for other sizes: 1/10 for 320x320, 1/20 for 640x640.
+
+    The same function decides the region inside :class:`GpuConverter`, so a
+    dataset script that calls it crops exactly what inference will capture.
+
+    Args:
+        size: ``(width, height)`` of the model input.
+        scale: requested region size over output size, at least ``1.0``.
+        align: both region sides are multiples of this. ``1`` keeps only the
+            exact aspect ratio.
+    """
+    width, height = int(size[0]), int(size[1])
+    if width <= 0 or height <= 0:
+        raise ValueError(f"size must be positive, got {size!r}")
+    scale = _validate_scale(scale)
+    if isinstance(align, bool) or int(align) != align or align < 1:
+        raise ValueError(f"align must be a positive integer, got {align!r}")
+    align = int(align)
+    # Exact aspect ratio: the region is n times the ratio's smallest integer
+    # form, (unit_w, unit_h). Both sides multiples of align: n a multiple of
+    # align / gcd(unit, align) for each side, so of their lcm.
+    common = math.gcd(width, height)
+    unit_w, unit_h = width // common, height // common
+    step = math.lcm(align // math.gcd(unit_w, align), align // math.gcd(unit_h, align))
+    # Scale 1 is n = common. The tolerance stops float noise from pushing an
+    # exact scale like 4/3 (n = 128.00000000000003) one step past itself.
+    n = math.ceil(common * scale / step - 1e-9) * step
+    return unit_w * n, unit_h * n
 
 
 class CrossAdapterRequired(RuntimeError):
@@ -563,7 +617,13 @@ class GpuConverter:
         layout: ``"nchw"`` (default) or ``"nhwc"`` for the float dtypes —
             ``(N, 3, H, W)`` or ``(N, H, W, 3)``, the same values in either
             order. ``uint8`` is inherently interleaved and must be ``"nhwc"``.
-        sampling: ``"bilinear"`` (default) or ``"nearest"``.
+        sampling: ``"bilinear"`` (default), ``"nearest"``, or ``"area"`` —
+            the mean of every texel an output pixel covers, weighted by
+            overlap, which is what ``cv2.INTER_AREA`` computes on reduction.
+            The filter to use when shrinking a capture into a model input:
+            bilinear reads a fixed 2x2 whatever the ratio, so at a 4:3
+            reduction its weights cycle pixel to pixel. ``"area"`` enlarges
+            bilinearly, as OpenCV does.
         normalize: emit 0..1 (the default). ``False`` emits 0..255 instead.
             Note this is not a division: the capture format is UNORM, so the
             GPU hands the shader 0..1 already and the byte range is what has
@@ -576,6 +636,18 @@ class GpuConverter:
             same convention as :attr:`Frame.region` and ``dirty_rects`` — to
             convert only that part of the frame. ``None`` (default) is the
             whole frame. Overridable per call in :meth:`process`.
+        capture_scale: capture a region about ``capture_scale`` times the
+            output size, centred on the frame, and reduce it to ``size``. The
+            region keeps the output's aspect ratio exactly and both its sides
+            are multiples of ``capture_align``; the scale is rounded *up* to
+            the next one where that holds (see :func:`capture_size`). With
+            ``size=(288, 384)``, ``1.3`` captures 384x512 and
+            :attr:`capture_scale` then reads 4/3. At least ``1.0`` — this
+            reduces, it does not enlarge — and the region must fit inside the
+            frame. Settable later via :attr:`capture_scale`. Not combinable
+            with ``crop``; pair it with ``sampling="area"``.
+        capture_align: what both sides of the ``capture_scale`` region are
+            multiples of (default 32). ``1`` keeps only the exact ratio.
         matrix: ``"bt709"`` (default) or ``"bt601"``. YUV output only.
         full_range: ``False`` (default) for limited range — Y 16–235, what
             encoders assume — or ``True`` for 0–255. YUV output only.
@@ -651,11 +723,26 @@ class GpuConverter:
         full_range: bool = False,
         batch: int = 1,
         allow_linear: bool = False,
+        capture_scale: Optional[float] = None,
+        capture_align: int = 32,
     ) -> None:
         gpu_converter = native.require_feature("GpuConverter12")
         self._allow_linear = bool(allow_linear)
         width, height = int(size[0]), int(size[1])
+        if capture_scale is not None and crop is not None:
+            raise ValueError(
+                "give crop or capture_scale, not both: capture_scale already "
+                "decides the region (centred, capture_scale times the output size)"
+            )
         self._crop = None if crop is None else _validate_crop(frame, crop)
+        self._capture_align = capture_align
+        self._capture_size = (
+            None if capture_scale is None
+            else capture_size((width, height), capture_scale, capture_align)
+        )
+        # Frame coordinates of the last single-region conversion, for mapping
+        # model output back. None until one runs, and after a multi-region call.
+        self._last_crop: Optional[Tuple[int, int, int, int]] = None
 
         if isinstance(batch, bool) or int(batch) != batch or batch < 1:
             raise ValueError(f"batch must be a positive integer, got {batch!r}")
@@ -872,11 +959,13 @@ class GpuConverter:
             native_args = dict(regions=texture_regions)
             count = len(regions)
         else:
-            native_args = dict(
-                crop=_texture_crop(
-                    frame, self._crop if crop is None else _validate_crop(frame, crop)
-                )
-            )
+            if crop is not None:
+                crop = _validate_crop(frame, crop)
+            elif self._capture_size is not None:
+                crop = self._scaled_crop(frame)
+            else:
+                crop = self._crop
+            native_args = dict(crop=_texture_crop(frame, crop))
             count = 1
         # The SRV is B8G8R8A8_UNORM, so the texture fetch *already* returns
         # 0..1 — the hardware normalises on read. Dividing by 255 here would
@@ -898,12 +987,84 @@ class GpuConverter:
         # Only after the dispatch succeeded: a refused call must not shrink
         # the shape describing the result that is still in the buffer.
         self._count = count
+        if regions is not None:
+            self._last_crop = None
+        else:
+            self._last_crop = crop if crop is not None else (0, 0, frame.width, frame.height)
         return self._tensor
+
+    def _scaled_crop(self, frame) -> Tuple[int, int, int, int]:
+        """The centred ``capture_size`` region, in frame coordinates. Refused
+        rather than shrunk when it does not fit: a smaller region would silently
+        change the scale the model was trained at."""
+        width, height = self._capture_size
+        if width > frame.width or height > frame.height:
+            raise ValueError(
+                f"capture_scale={self.capture_scale:g} needs a {width}x{height} "
+                f"region, which does not fit the {frame.width}x{frame.height} frame"
+            )
+        left = (frame.width - width) // 2
+        top = (frame.height - height) // 2
+        return _validate_crop(frame, (left, top, left + width, top + height))
 
     @property
     def crop(self) -> Optional[Tuple[int, int, int, int]]:
         """The default crop, in frame coordinates, or ``None`` for the whole frame."""
         return self._crop
+
+    @property
+    def capture_scale(self) -> Optional[float]:
+        """Region size over output size *as applied* — after rounding up to
+        the exact ratio and ``capture_align`` — or ``None`` when ``crop`` (or
+        the whole frame) decides the region instead. Set ``1.3`` on a 288x384
+        output and this reads 1.3333.
+
+        Settable between calls; takes effect on the next :meth:`process`.
+        Setting it clears the constructor's ``crop``, and ``None`` goes back to
+        the whole frame.
+        """
+        if self._capture_size is None:
+            return None
+        return self._capture_size[0] / self.out_width
+
+    @capture_scale.setter
+    def capture_scale(self, value: Optional[float]) -> None:
+        self._capture_size = (
+            None if value is None
+            else capture_size((self.out_width, self.out_height), value, self._capture_align)
+        )
+        self._crop = None
+
+    @property
+    def capture_size(self) -> Optional[Tuple[int, int]]:
+        """``(width, height)`` of the ``capture_scale`` region, or ``None``."""
+        return self._capture_size
+
+    @property
+    def capture_region(self) -> Optional[Tuple[int, int, int, int]]:
+        """``(left, top, right, bottom)`` in frame coordinates that the last
+        :meth:`process` converted. ``None`` before the first call and after a
+        multi-region one, which has no single region to report."""
+        return self._last_crop
+
+    def to_frame(self, x: float, y: float) -> Tuple[float, float]:
+        """Map a point in the output (model) image to frame coordinates.
+
+        Continuous coordinates: ``(0, 0)`` is the top-left *corner* of the
+        output and ``(out_width, out_height)`` its bottom-right, so box corners
+        from a detector map directly. Uses :attr:`capture_region` — the region
+        the last call actually converted, after rounding — so the result is
+        exact for the tensor currently in the buffer. Add the camera's region
+        offset, if it has one, for monitor coordinates.
+        """
+        if self._last_crop is None:
+            raise RuntimeError(
+                "no single-region conversion to map from: call process() first "
+                "(a multi-region call has one region per slot)"
+            )
+        left, top, right, bottom = self._last_crop
+        return (left + x * (right - left) / self.out_width,
+                top + y * (bottom - top) / self.out_height)
 
     @property
     def shape(self) -> Tuple[int, ...]:

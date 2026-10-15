@@ -704,7 +704,8 @@ impl TensorTransfer {
 /// `tests/test_gpu_preprocess.py` pins, and an A/B that cannot say which
 /// sampling it timed is not a measurement.
 ///
-/// `sampling` is `"nearest"` or `"bilinear"`. `dtype` is `"float32"`,
+/// `sampling` is `"nearest"`, `"bilinear"` or `"area"` (`cv2.INTER_AREA` on
+/// reduction, bilinear when enlarging). `dtype` is `"float32"`,
 /// `"float16"` or `"bgra8"` — the last being a *resized frame* rather than a
 /// tensor, which is the cheap payload § 6.1's ordering question needs.
 #[pyclass(name = "GpuConverter12", unsendable)]
@@ -735,9 +736,10 @@ impl GpuConverter12 {
         let sampling = match sampling {
             "nearest" => converter12::Sampling::Nearest,
             "bilinear" => converter12::Sampling::Bilinear,
+            "area" => converter12::Sampling::Area,
             other => {
                 return Err(PyValueError::new_err(format!(
-                    "sampling must be 'nearest' or 'bilinear', got {other:?}"
+                    "sampling must be 'nearest', 'bilinear' or 'area', got {other:?}"
                 )))
             }
         };
@@ -964,6 +966,7 @@ impl GpuConverter12 {
         Ok(match inner.sampling {
             converter12::Sampling::Nearest => "nearest",
             converter12::Sampling::Bilinear => "bilinear",
+            converter12::Sampling::Area => "area",
         })
     }
 
