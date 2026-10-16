@@ -49,9 +49,9 @@ def test_capture_scale_sets_and_changes_the_region(camera):
             stream.capture_scale = 0.5
         assert stream.capture_scale == 1.0
 
-        # Not a valid scale for 288x384: rounds up to the next, 4/3.
+        # 96 * 1.3 = 124.8: rounds up to 125 units of 3:4, a scale of 125/96.
         stream.capture_scale = 1.3
-        assert stream.capture_size == (384, 512)
-        assert stream.capture_scale == pytest.approx(4 / 3)
+        assert stream.capture_size == (375, 500)
+        assert stream.capture_scale == pytest.approx(125 / 96)
         next(stream)
-        assert stream.capture_region == centred(stream.frame, 384, 512)
+        assert stream.capture_region == centred(stream.frame, 375, 500)

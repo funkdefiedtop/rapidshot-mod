@@ -27,8 +27,8 @@ from rapidshot.converter import capture_size
         (2.0, (576, 768)),
     ],
 )
-def test_288x384_steps_by_a_third(scale, expected):
-    assert capture_size((288, 384), scale) == expected
+def test_288x384_at_align_32_steps_by_a_third(scale, expected):
+    assert capture_size((288, 384), scale, align=32) == expected
 
 
 @pytest.mark.parametrize(
@@ -40,13 +40,35 @@ def test_288x384_steps_by_a_third(scale, expected):
         ((288, 384), 1.3, (384, 512)),
     ],
 )
-def test_other_sizes(size, scale, expected):
+def test_other_sizes_at_align_32(size, scale, expected):
+    assert capture_size(size, scale, align=32) == expected
+
+
+@pytest.mark.parametrize(
+    "size, scale, expected",
+    [
+        ((288, 384), 1.0, (288, 384)),
+        ((288, 384), 1.3, (375, 500)),    # 96 * 1.3 = 124.8 -> 125 units of 3:4
+        ((288, 384), 1.5, (432, 576)),    # exact, not rounded up to 5/3
+        ((288, 384), 1.25, (360, 480)),
+        ((384, 512), 1.5, (576, 768)),    # the same field at 4/3 and 2x the input
+        ((576, 768), 1.5, (864, 1152)),
+        ((300, 300), 1.0, (300, 300)),    # the input is never rounded
+    ],
+)
+def test_default_keeps_only_the_ratio(size, scale, expected):
     assert capture_size(size, scale) == expected
 
 
-def test_align_1_keeps_only_the_ratio():
-    # 96 * 1.3 = 124.8 -> 125 units of 3:4.
-    assert capture_size((288, 384), 1.3, align=1) == (375, 500)
+@pytest.mark.parametrize(
+    "size, scale",
+    list(itertools.product([(288, 384), (384, 512), (576, 768)], [1.25, 1.5, 1.75, 2.0])),
+)
+def test_quarter_scales_are_exact_for_one_shape_at_three_sizes(size, scale):
+    # One 3:4 input at 1x, 4/3 and 2x: with no align the region is exactly
+    # scale times the input, so the three capture the same share of their
+    # screens.
+    assert capture_size(size, scale) == (size[0] * scale, size[1] * scale)
 
 
 @pytest.mark.parametrize(

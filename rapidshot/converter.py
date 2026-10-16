@@ -68,25 +68,39 @@ def _validate_scale(scale) -> float:
     return value
 
 
-def capture_size(size: Tuple[int, int], scale: float, align: int = 32) -> Tuple[int, int]:
+# The region is reduced to the model input, so only the input's size matters
+# to the model (stride multiples and the like are the caller's to choose).
+# The region itself needs the exact aspect ratio and nothing more.
+DEFAULT_CAPTURE_ALIGN = 1
+
+
+def capture_size(
+    size: Tuple[int, int], scale: float, align: int = DEFAULT_CAPTURE_ALIGN
+) -> Tuple[int, int]:
     """The ``(width, height)`` captured for an output *size* at *scale*.
 
     The smallest region at least *scale* times *size* whose aspect ratio is
     **exactly** the output's and whose sides are both multiples of *align*.
     The scale is rounded *up* to the next one that allows that, never down, so
-    the region is never smaller than asked for. For ``size=(288, 384)`` and the
-    default ``align=32`` the regions are 96k x 128k -- scales 1, 4/3, 5/3, 2,
-    ... -- so ``1.3`` gives 384x512 and ``1.34`` gives 480x640. Steps are
-    finer for other sizes: 1/10 for 320x320, 1/20 for 640x640.
+    the region is never smaller than asked for.
+
+    An exact ratio means the region is ``n`` times the ratio's smallest
+    integer form, so scales step by ``1 / gcd(width, height)``: 1/96 for
+    288x384 (``1.3`` gives 375x500, ``1.5`` gives 432x576), 1/128 for 384x512,
+    1/640 for 640x640. *align* coarsens the steps: for 288x384, ``align=32``
+    leaves only 96k x 128k -- scales 1, 4/3, 5/3, 2 -- and ``align=8`` steps by
+    1/12. *size* itself is never rounded; whatever multiple the model needs
+    is the caller's to pass.
 
     The same function decides the region inside :class:`GpuConverter`, so a
     dataset script that calls it crops exactly what inference will capture.
 
     Args:
-        size: ``(width, height)`` of the model input.
+        size: ``(width, height)`` of the model input -- the tensor produced.
         scale: requested region size over output size, at least ``1.0``.
-        align: both region sides are multiples of this. ``1`` keeps only the
-            exact aspect ratio.
+        align: both *region* sides are multiples of this (default 1: the
+            exact ratio only). Not the model input's multiple -- the region
+            is reduced to *size* before the model sees it.
     """
     width, height = int(size[0]), int(size[1])
     if width <= 0 or height <= 0:
@@ -641,13 +655,14 @@ class GpuConverter:
             region keeps the output's aspect ratio exactly and both its sides
             are multiples of ``capture_align``; the scale is rounded *up* to
             the next one where that holds (see :func:`capture_size`). With
-            ``size=(288, 384)``, ``1.3`` captures 384x512 and
-            :attr:`capture_scale` then reads 4/3. At least ``1.0`` — this
+            ``size=(288, 384)``, ``1.3`` captures 375x500 and
+            :attr:`capture_scale` then reads 1.302 (125/96). At least ``1.0`` — this
             reduces, it does not enlarge — and the region must fit inside the
             frame. Settable later via :attr:`capture_scale`. Not combinable
             with ``crop``; pair it with ``sampling="area"``.
-        capture_align: what both sides of the ``capture_scale`` region are
-            multiples of (default 32). ``1`` keeps only the exact ratio.
+        capture_align: what both sides of the ``capture_scale`` *region* are
+            multiples of (default 1: the exact ratio only). The output is
+            always exactly ``size``; this only coarsens the scale steps.
         matrix: ``"bt709"`` (default) or ``"bt601"``. YUV output only.
         full_range: ``False`` (default) for limited range — Y 16–235, what
             encoders assume — or ``True`` for 0–255. YUV output only.
@@ -724,7 +739,7 @@ class GpuConverter:
         batch: int = 1,
         allow_linear: bool = False,
         capture_scale: Optional[float] = None,
-        capture_align: int = 32,
+        capture_align: int = DEFAULT_CAPTURE_ALIGN,
     ) -> None:
         gpu_converter = native.require_feature("GpuConverter12")
         self._allow_linear = bool(allow_linear)
@@ -1017,7 +1032,7 @@ class GpuConverter:
         """Region size over output size *as applied* — after rounding up to
         the exact ratio and ``capture_align`` — or ``None`` when ``crop`` (or
         the whole frame) decides the region instead. Set ``1.3`` on a 288x384
-        output and this reads 1.3333.
+        output and this reads 1.3021 (a 375x500 region, 125/96).
 
         Settable between calls; takes effect on the next :meth:`process`.
         Setting it clears the constructor's ``crop``, and ``None`` goes back to

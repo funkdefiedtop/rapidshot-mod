@@ -229,7 +229,7 @@ class TensorStream:
         # Validated now, so a bad value fails at the assignment rather than on
         # the next frame, and kept in the options so a rebuilt converter has it.
         if value is not None:
-            _converter.capture_size(self._size, value, self._options.get("capture_align", 32))
+            _converter.capture_size(self._size, value, self._options.get("capture_align", _converter.DEFAULT_CAPTURE_ALIGN))
         if self._converter is not None:
             self._converter.capture_scale = value
         self._options.pop("crop", None)
@@ -241,7 +241,7 @@ class TensorStream:
         scale = self._options.get("capture_scale")
         if scale is None:
             return None
-        return _converter.capture_size(self._size, scale, self._options.get("capture_align", 32))
+        return _converter.capture_size(self._size, scale, self._options.get("capture_align", _converter.DEFAULT_CAPTURE_ALIGN))
 
     @property
     def capture_region(self) -> Optional[Tuple[int, int, int, int]]:

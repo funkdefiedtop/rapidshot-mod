@@ -21,16 +21,20 @@ each release can be traced back to the plan it implements.
   384x512 -> 288x384 FP16 on an RTX 3080: 0.083 ms against bilinear's 0.076.
 - **`capture_scale` for `GpuConverter` and `TensorStream`.** Captures a region
   about `capture_scale` times the output size, centred on the frame, and
-  reduces it to the model input. The region keeps the output's aspect ratio
-  exactly and both sides are multiples of `capture_align` (default 32), so the
-  scale is rounded *up* to the next one where that holds: for 288x384 the
-  regions are 96k x 128k, and `capture_scale=1.3` captures 384x512 and then
-  reads 4/3. Settable between frames. `capture_region` reports the region the
+  reduces it to the model input. The output is always exactly `size`; the
+  region keeps its aspect ratio exactly, so the scale is rounded *up* to the
+  next one where that holds -- steps of `1 / gcd(width, height)`, 1/96 for
+  288x384, where `capture_scale=1.3` captures 375x500 and `1.5` captures
+  432x576. `capture_align` (default 1) additionally makes both region sides
+  multiples of it, coarsening the steps: `capture_align=32` leaves 288x384
+  only 96k x 128k regions. Settable between frames. `capture_region` reports the region the
   last call converted and `to_frame(x, y)` maps output coordinates back to the
   frame. A scale below 1.0, or a region that does not fit the frame, is refused
   rather than clamped.
-- **`rapidshot.capture_size(size, scale, align=32)`**, the rounding above as a
+- **`rapidshot.capture_size(size, scale, align=1)`**, the rounding above as a
   function, so a dataset script crops exactly the region inference captures.
+- **`CAPTURE_SCALE_GUIDE.md`**: integration guide for `capture_scale` --
+  invariants, the math, dataset recipe, multi-model setup, verification.
 
 ## [2.6.3] - 2026-09-30
 

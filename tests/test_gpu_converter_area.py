@@ -183,16 +183,23 @@ def centred(frame, width, height):
 
 
 @pytest.mark.parametrize(
-    "scale, region_size",
-    [(1.0, (288, 384)), (4 / 3, (384, 512)), (1.3, (384, 512)), (1.34, (480, 640))],
+    "scale, align, region_size",
+    [
+        (1.0, 1, (288, 384)),
+        (4 / 3, 1, (384, 512)),
+        (1.3, 1, (375, 500)),     # exact ratio only: 125 units of 3:4
+        (1.5, 1, (432, 576)),
+        (1.3, 32, (384, 512)),    # align=32 rounds up to the next 96k x 128k
+        (1.34, 32, (480, 640)),
+    ],
 )
-def test_capture_scale_is_a_centred_crop(live_frame, scale, region_size):
+def test_capture_scale_is_a_centred_crop(live_frame, scale, align, region_size):
     if region_size[0] > live_frame.width or region_size[1] > live_frame.height:
         pytest.skip("frame too small for this region")
     region = centred(live_frame, *region_size)
     converter = rapidshot.GpuConverter(
         live_frame, (288, 384), dtype="uint8", layout="nhwc",
-        sampling="area", capture_scale=scale,
+        sampling="area", capture_scale=scale, capture_align=align,
     )
     got = converter.process(live_frame).numpy()[0]
     assert converter.capture_region == region
@@ -218,9 +225,8 @@ def test_per_call_crop_overrides_capture_scale(live_frame):
     converter.process(live_frame, crop=(0, 0, 64, 64))
     assert converter.capture_region == (0, 0, 64, 64)
     converter.process(live_frame)
-    # 1.5 x 32 = 48 is not a multiple of 32, so the region rounds up to 64.
-    assert converter.capture_region == centred(live_frame, 64, 64)
-    assert converter.capture_scale == 2.0
+    assert converter.capture_region == centred(live_frame, 48, 48)
+    assert converter.capture_scale == 1.5
 
 
 def test_to_frame_maps_corners_onto_the_region(live_frame):
