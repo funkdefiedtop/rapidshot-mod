@@ -672,11 +672,15 @@ struct Submitter {
 
 impl Submitter {
     /// A copy queue: moving bytes is exactly what the DMA engine is for.
-    fn new(device: &ID3D12Device) -> windows::core::Result<Self> {
+    ///
+    /// `priority` is a `D3D12_COMMAND_QUEUE_PRIORITY`: 0 normal, 100 high. Only
+    /// the queue that reads the capture surface is ever raised; see
+    /// `CrossAdapterTransfer::new`.
+    fn new(device: &ID3D12Device, priority: i32) -> windows::core::Result<Self> {
         let queue: ID3D12CommandQueue = unsafe {
             device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
                 Type: D3D12_COMMAND_LIST_TYPE_COPY,
-                Priority: 0,
+                Priority: priority,
                 Flags: D3D12_COMMAND_QUEUE_FLAG_NONE,
                 NodeMask: 0,
             })?
@@ -949,7 +953,11 @@ impl CrossAdapterTransfer {
     ///
     /// The source adapter is not a choice: it is whichever adapter owns the
     /// texture, because that is where Desktop Duplication put it.
-    pub fn new(texture: &ID3D11Texture2D) -> windows::core::Result<Self> {
+    ///
+    /// `queue_priority` (a `D3D12_COMMAND_QUEUE_PRIORITY`, 0 = normal, 100 =
+    /// high) applies to the source copy queue only -- the one competing with
+    /// the compositor on a hybrid laptop's iGPU.
+    pub fn new(texture: &ID3D11Texture2D, queue_priority: i32) -> windows::core::Result<Self> {
         let mut desc = Default::default();
         unsafe { texture.GetDesc(&mut desc) };
         let (width, height) = (desc.Width, desc.Height);
@@ -1135,8 +1143,8 @@ impl CrossAdapterTransfer {
         });
         let capture_order = crate::capture_order::CaptureOrder::new(&src_device)?;
         Ok(Self {
-            src: Submitter::new(&src_device)?,
-            dst: Submitter::new(&dst_device)?,
+            src: Submitter::new(&src_device, queue_priority)?,
+            dst: Submitter::new(&dst_device, 0)?,
             src_device,
             dst_device,
             _src_heap: src_heap,
@@ -1249,6 +1257,95 @@ impl CrossAdapterTransfer {
     /// the destination adapter by the time this returns.
     pub fn transfer(&self, texture: &ID3D11Texture2D, source_id: u64) -> windows::core::Result<()> {
         self.copy_from(texture, false, source_id)
+    }
+
+    /// Copy only `width` x `height` texels at `(left, top)` of the captured
+    /// frame into the start of the shared heap, and return the row pitch.
+    ///
+    /// Blocks like `transfer`. The rows are laid out as `GetCopyableFootprints`
+    /// lays out a texture of the region's size: `row_pitch` bytes apart, the
+    /// pitch padded to D3D12's 256-byte copy alignment. The heap is sized for
+    /// the whole frame, so any region fits and moving or resizing it needs no
+    /// rebuild. A consumer that converts on arrival then moves a region rather
+    /// than a frame: a 432x576 BGRA region is under 1 MB against 8.3 MB at 1080p.
+    #[allow(clippy::too_many_arguments)]
+    pub fn transfer_region(
+        &self,
+        texture: &ID3D11Texture2D,
+        source_id: u64,
+        left: u32,
+        top: u32,
+        width: u32,
+        height: u32,
+    ) -> windows::core::Result<u32> {
+        self.ensure_submission_usable()?;
+        let mut desc = Default::default();
+        unsafe { texture.GetDesc(&mut desc) };
+        self.validate_texture_desc(&desc)?;
+        let inside = |start: u32, size: u32, limit: u32| {
+            size > 0 && start.checked_add(size).is_some_and(|end| end <= limit)
+        };
+        if !inside(left, width, self.width) || !inside(top, height, self.height) {
+            return Err(windows::core::Error::new(
+                windows::Win32::Foundation::E_INVALIDARG,
+                format!(
+                    "region {width}x{height} at ({left}, {top}) does not fit in the \
+                     {}x{} frame",
+                    self.width, self.height
+                ),
+            ));
+        }
+
+        // Same entry protocol as `copy_from`: drain an async submission before
+        // the allocator is reset, then order behind the capture's own copy.
+        self.wait_shared_fence(self.shared_fence_value.get())?;
+        let shared = self.open_capture_texture(texture, source_id)?;
+        self.capture_order.order(&self.src.queue, texture)?;
+
+        let (footprint, _) = build_copy_footprint_with(
+            width,
+            height,
+            self.format,
+            &mut |texture_desc, footprint, total| unsafe {
+                self.src_device.GetCopyableFootprints(
+                    texture_desc,
+                    0,
+                    1,
+                    0,
+                    Some(footprint),
+                    None,
+                    None,
+                    Some(total),
+                );
+            },
+        );
+        let region = D3D12_BOX {
+            left,
+            top,
+            front: 0,
+            right: left + width,
+            bottom: top + height,
+            back: 1,
+        };
+        let mut src_location = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: core::mem::ManuallyDrop::new(Some(shared)),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: 0,
+            },
+        };
+        let mut destination = placed_location(&self.src_buffer, footprint);
+
+        let list = self.src.begin()?;
+        unsafe { list.CopyTextureRegion(&destination, 0, 0, 0, &src_location, Some(&region)) };
+        let submitted = self.src.end_and_wait();
+
+        unsafe {
+            core::mem::ManuallyDrop::drop(&mut destination.pResource);
+            core::mem::ManuallyDrop::drop(&mut src_location.pResource);
+        }
+        submitted?;
+        Ok(footprint.Footprint.RowPitch)
     }
 
     /// Copy the texture into the shared heap, optionally mirroring the same
@@ -2011,6 +2108,16 @@ impl CrossAdapterTransfer {
         self.dst_device.as_raw() as usize
     }
 
+    /// LUID of the destination adapter, 8 little-endian bytes -- pair with
+    /// CUDA's `cuDeviceGetLuid`, as for `TensorTransfer::destination_luid`.
+    pub fn destination_luid(&self) -> [u8; 8] {
+        let luid = unsafe { self.dst_device.GetAdapterLuid() };
+        let mut out = [0u8; 8];
+        out[..4].copy_from_slice(&luid.LowPart.to_le_bytes());
+        out[4..].copy_from_slice(&luid.HighPart.to_le_bytes());
+        out
+    }
+
     pub fn total_bytes(&self) -> u64 {
         self.total_bytes
     }
@@ -2209,7 +2316,7 @@ pub fn probe_cross_adapter_buffer(
         }
         let shared = shared.expect("CreatePlacedResource reported success");
 
-        let submitter = Submitter::new(&src_device)?;
+        let submitter = Submitter::new(&src_device, 0)?;
         let mut timings = Vec::with_capacity(iterations);
         // One untimed pass so first-copy driver warm-up stays out of the sample.
         for i in 0..=iterations {
@@ -2285,7 +2392,12 @@ pub struct TensorTransfer {
 }
 
 impl TensorTransfer {
-    pub fn new(converter: &crate::converter12::Converter12) -> windows::core::Result<Self> {
+    /// `queue_priority` as for `CrossAdapterTransfer::new`: the source copy
+    /// queue, on the capture adapter.
+    pub fn new(
+        converter: &crate::converter12::Converter12,
+        queue_priority: i32,
+    ) -> windows::core::Result<Self> {
         let size_bytes = converter.output_byte_size();
         let src_device = converter.device().clone();
         let src_luid = unsafe { src_device.GetAdapterLuid() };
@@ -2381,7 +2493,7 @@ impl TensorTransfer {
         }
         // Before the handle is released to `Self`, so a failure here still
         // closes it.
-        let src = Submitter::new(&src_device)?;
+        let src = Submitter::new(&src_device, queue_priority)?;
 
         Ok(Self {
             src,
@@ -2431,7 +2543,7 @@ impl TensorTransfer {
     /// undoes the entire point of the path.
     pub fn read_back_destination(&self) -> windows::core::Result<Vec<u8>> {
         let readback = make_readback_buffer(&self.dst_device, self.size_bytes)?;
-        let dst = Submitter::new(&self.dst_device)?;
+        let dst = Submitter::new(&self.dst_device, 0)?;
         let list = dst.begin()?;
         unsafe { list.CopyBufferRegion(&readback, 0, &self.dst_buffer, 0, self.size_bytes) };
         dst.end_and_wait()?;

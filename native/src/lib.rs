@@ -591,13 +591,16 @@ struct TensorTransfer {
 
 #[pymethods]
 impl TensorTransfer {
+    /// `queue_priority`: D3D12_COMMAND_QUEUE_PRIORITY of the copy queue on the
+    /// capture adapter, 0 normal (default) or 100 high.
     #[new]
-    fn new(converter: &GpuConverter12) -> PyResult<Self> {
+    #[pyo3(signature = (converter, *, queue_priority=0))]
+    fn new(converter: &GpuConverter12, queue_priority: i32) -> PyResult<Self> {
         let source = converter
             .inner
             .lock()
             .map_err(|_| PyRuntimeError::new_err("converter lock poisoned"))?;
-        let inner = cross_adapter::TensorTransfer::new(&source)
+        let inner = cross_adapter::TensorTransfer::new(&source, queue_priority)
             .map_err(|e| PyRuntimeError::new_err(format!("tensor transfer setup failed: {e}")))?;
         Ok(Self {
             inner: Mutex::new(inner),
@@ -719,7 +722,7 @@ impl GpuConverter12 {
     #[pyo3(signature = (
         texture_ptr, out_width, out_height, *,
         sampling="bilinear", dtype="float32", matrix="bt709", full_range=false, batch=1,
-        layout=None
+        layout=None, queue_priority=0
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -732,6 +735,7 @@ impl GpuConverter12 {
         full_range: bool,
         batch: u32,
         layout: Option<&str>,
+        queue_priority: i32,
     ) -> PyResult<Self> {
         let sampling = match sampling {
             "nearest" => converter12::Sampling::Nearest,
@@ -783,7 +787,7 @@ impl GpuConverter12 {
         let inner = unsafe {
             with_texture(texture_ptr, |texture| {
                 converter12::Converter12::new(
-                    texture, out_width, out_height, sampling, format, yuv, batch,
+                    texture, out_width, out_height, sampling, format, yuv, batch, queue_priority,
                 )
                 .map_err(|e| PyRuntimeError::new_err(format!("D3D12 converter setup failed: {e}")))
             })?
@@ -1250,11 +1254,14 @@ struct CrossAdapterTransfer {
 
 #[pymethods]
 impl CrossAdapterTransfer {
+    /// `queue_priority`: D3D12_COMMAND_QUEUE_PRIORITY of the source copy queue,
+    /// 0 normal (default) or 100 high.
     #[new]
-    fn new(texture_ptr: usize) -> PyResult<Self> {
+    #[pyo3(signature = (texture_ptr, *, queue_priority=0))]
+    fn new(texture_ptr: usize, queue_priority: i32) -> PyResult<Self> {
         let inner = unsafe {
             with_texture(texture_ptr, |texture| {
-                cross_adapter::CrossAdapterTransfer::new(texture).map_err(|e| {
+                cross_adapter::CrossAdapterTransfer::new(texture, queue_priority).map_err(|e| {
                     PyRuntimeError::new_err(format!("cross-adapter setup failed: {e}"))
                 })
             })?
@@ -1282,6 +1289,29 @@ impl CrossAdapterTransfer {
                         .map_err(|e| PyRuntimeError::new_err(format!("transfer failed: {e}")))
                 })
             }
+        }
+    }
+
+    /// Copy only `(left, top, width, height)` of the frame to the start of the
+    /// shared heap; returns the row pitch in bytes. Blocks like `transfer`.
+    #[pyo3(signature = (texture_ptr, left, top, width, height, source_id=0))]
+    #[allow(clippy::too_many_arguments)]
+    fn transfer_region(
+        &self,
+        texture_ptr: usize,
+        left: u32,
+        top: u32,
+        width: u32,
+        height: u32,
+        source_id: u64,
+    ) -> PyResult<u32> {
+        let inner = self.lock()?;
+        unsafe {
+            with_texture(texture_ptr, |texture| {
+                inner
+                    .transfer_region(texture, source_id, left, top, width, height)
+                    .map_err(|e| PyRuntimeError::new_err(format!("region transfer failed: {e}")))
+            })
         }
     }
 
@@ -1579,6 +1609,11 @@ impl CrossAdapterTransfer {
     #[getter]
     fn destination_is_software(&self) -> PyResult<bool> {
         Ok(self.lock()?.destination_is_software)
+    }
+
+    /// LUID of the destination adapter, 8 little-endian bytes.
+    fn destination_luid<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        Ok(PyBytes::new(py, &self.lock()?.destination_luid()))
     }
 
     #[getter]

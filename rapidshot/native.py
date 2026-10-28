@@ -719,8 +719,12 @@ class CrossAdapterTransfer:
     engine moves the bytes instead of CPU cores.
     """
 
-    def __init__(self, frame):
-        self._inner = require().CrossAdapterTransfer(_texture_address(frame))
+    def __init__(self, frame, *, queue_priority: int = 0):
+        """``queue_priority``: ``D3D12_COMMAND_QUEUE_PRIORITY`` of the source copy
+        queue -- 0 normal (default), 100 high. Passed only when non-zero, so an
+        older native build still loads."""
+        extra = {"queue_priority": int(queue_priority)} if queue_priority else {}
+        self._inner = require().CrossAdapterTransfer(_texture_address(frame), **extra)
 
     def transfer(self, frame) -> None:
         """Copy one frame across.
@@ -729,6 +733,29 @@ class CrossAdapterTransfer:
         the destination adapter when this returns.
         """
         self._inner.transfer(_texture_address(frame), _source_id(frame))
+
+    def transfer_region(self, frame, left: int, top: int, width: int, height: int) -> int:
+        """Copy only ``width`` x ``height`` texels at ``(left, top)``; return the row pitch.
+
+        The region lands at the start of the shared destination, rows the
+        returned number of bytes apart (padded to D3D12's 256-byte copy
+        alignment), still in :attr:`dxgi_format`. Blocks like :meth:`transfer`.
+        Coordinates are texels of the captured surface. The heap holds a whole
+        frame, so the region may move or change size between calls.
+        """
+        return int(self._inner.transfer_region(
+            _texture_address(frame), int(left), int(top), int(width), int(height),
+            _source_id(frame)))
+
+    @property
+    def destination_luid(self) -> bytes:
+        """LUID of the destination adapter, 8 little-endian bytes (``cuDeviceGetLuid``)."""
+        return bytes(self._inner.destination_luid())
+
+    @property
+    def supports_region(self) -> bool:
+        """Whether the native build has :meth:`transfer_region` (rapidshot-mod)."""
+        return hasattr(self._inner, "transfer_region")
 
     def read_back_destination(self) -> bytes:
         """Read the frame back through the destination device.

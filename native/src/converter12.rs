@@ -697,6 +697,7 @@ impl Converter12 {
         format: OutputFormat,
         yuv: YuvOptions,
         batch: u32,
+        queue_priority: i32,
     ) -> windows::core::Result<Self> {
         if out_width == 0 || out_height == 0 {
             return Err(windows::core::Error::new(
@@ -784,9 +785,10 @@ impl Converter12 {
         let device = super::preprocess12::device_for_texture(d3d11_texture)?;
 
         let queue: ID3D12CommandQueue = unsafe {
+            // `queue_priority`: D3D12_COMMAND_QUEUE_PRIORITY, 0 normal / 100 high.
             device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
                 Type: D3D12_COMMAND_LIST_TYPE_COMPUTE,
-                Priority: 0,
+                Priority: queue_priority,
                 Flags: D3D12_COMMAND_QUEUE_FLAG_NONE,
                 NodeMask: 0,
             })?

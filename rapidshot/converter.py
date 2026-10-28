@@ -551,9 +551,13 @@ class TensorTransfer:
             reaches the tensor where it is.
     """
 
-    def __init__(self, converter: "GpuConverter") -> None:
+    def __init__(self, converter: "GpuConverter", *, queue_priority: int = 0) -> None:
+        """``queue_priority``: ``D3D12_COMMAND_QUEUE_PRIORITY`` of the copy queue
+        on the capture adapter -- 0 normal (default), 100 high. Passed to the
+        native layer only when non-zero, so an older build still loads."""
         self._converter = converter
-        self._impl = native.require_feature("TensorTransfer")(converter._impl)
+        extra = {"queue_priority": int(queue_priority)} if queue_priority else {}
+        self._impl = native.require_feature("TensorTransfer")(converter._impl, **extra)
 
     def transfer(self) -> None:
         """Copy the converter's current output across. Blocks until complete.
@@ -740,6 +744,7 @@ class GpuConverter:
         allow_linear: bool = False,
         capture_scale: Optional[float] = None,
         capture_align: int = DEFAULT_CAPTURE_ALIGN,
+        queue_priority: int = 0,
     ) -> None:
         gpu_converter = native.require_feature("GpuConverter12")
         self._allow_linear = bool(allow_linear)
@@ -806,6 +811,10 @@ class GpuConverter:
             native_layout = layout
         self._refuse_linear(frame, yuv=layout == "yuv420", dtype=dtype)
 
+        # queue_priority: D3D12_COMMAND_QUEUE_PRIORITY of the compute queue, 0
+        # normal (default) or 100 high -- passed only when set, so an older
+        # native build still loads.
+        extra = {"queue_priority": int(queue_priority)} if queue_priority else {}
         self._impl = gpu_converter(
             native._texture_address(frame),
             width,
@@ -816,6 +825,7 @@ class GpuConverter:
             full_range=bool(full_range),
             batch=batch,
             layout=native_layout,
+            **extra,
         )
         self.out_width = width
         self.out_height = height
