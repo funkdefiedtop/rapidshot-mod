@@ -686,6 +686,35 @@ pub struct Converter12 {
     /// Most regions one `process` call can convert; the output buffer holds
     /// this many slots.
     pub batch: u32,
+    /// Diagnostics, off by default (`set_timing`): GPU timestamps at the start
+    /// and end of each dispatch's command list, resolved into a readback
+    /// buffer, plus the CPU QPC at submission. The list starts only once the
+    /// queued capture-order `Wait` is satisfied, so start minus submission is
+    /// the wait for the capture device's copy (and the queue), end minus start
+    /// the shader. Created on first use.
+    timing: std::cell::RefCell<Option<Timing>>,
+}
+
+struct Timing {
+    queries: ID3D12QueryHeap,
+    readback: ID3D12Resource,
+    submit_qpc: std::cell::Cell<i64>,
+}
+
+fn qpc_now() -> i64 {
+    let mut value = 0i64;
+    unsafe {
+        let _ = windows::Win32::System::Performance::QueryPerformanceCounter(&mut value);
+    }
+    value
+}
+
+fn qpc_frequency() -> i64 {
+    let mut value = 0i64;
+    unsafe {
+        let _ = windows::Win32::System::Performance::QueryPerformanceFrequency(&mut value);
+    }
+    value
 }
 
 impl Converter12 {
@@ -1015,6 +1044,7 @@ impl Converter12 {
             cached_shared: std::cell::RefCell::new(None),
             cached_src_size: std::cell::Cell::new((0, 0)),
             cached_src_format: std::cell::Cell::new(DXGI_FORMAT(0)),
+            timing: std::cell::RefCell::new(None),
             out_width,
             out_height,
             sampling,
@@ -1027,6 +1057,78 @@ impl Converter12 {
     fn wait_for_gpu(&self) -> windows::core::Result<()> {
         crate::wait_armed(self.arm_gpu_wait()?);
         Ok(())
+    }
+
+    /// Turn the per-dispatch timestamps on or off (diagnostics; see `timing`).
+    pub fn set_timing(&self, on: bool) -> windows::core::Result<()> {
+        let mut timing = self.timing.borrow_mut();
+        if !on {
+            *timing = None;
+            return Ok(());
+        }
+        if timing.is_none() {
+            let mut queries: Option<ID3D12QueryHeap> = None;
+            unsafe {
+                self.device.CreateQueryHeap(
+                    &D3D12_QUERY_HEAP_DESC {
+                        Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                        Count: 2,
+                        NodeMask: 0,
+                    },
+                    &mut queries,
+                )?
+            };
+            let readback = super::preprocess12::create_buffer(
+                &self.device,
+                16,
+                D3D12_HEAP_TYPE_READBACK,
+                D3D12_HEAP_FLAG_NONE,
+                D3D12_RESOURCE_FLAG_NONE,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )?;
+            *timing = Some(Timing {
+                queries: queries.expect("CreateQueryHeap reported success"),
+                readback,
+                submit_qpc: std::cell::Cell::new(0),
+            });
+        }
+        Ok(())
+    }
+
+    /// The last finished dispatch, in milliseconds: (submission -> list start
+    /// = wait for the capture copy and the queue, list start -> end = shader,
+    /// end -> now = how late the CPU learned of it). Call after `process`
+    /// returned. `None` while timing is off.
+    pub fn last_timing(&self) -> windows::core::Result<Option<(f64, f64, f64)>> {
+        let timing = self.timing.borrow();
+        let Some(timing) = timing.as_ref() else {
+            return Ok(None);
+        };
+        let now = qpc_now();
+        let (start, end) = unsafe {
+            let mut mapped: *mut std::ffi::c_void = std::ptr::null_mut();
+            timing.readback.Map(
+                0,
+                Some(&D3D12_RANGE { Begin: 0, End: 16 }),
+                Some(&mut mapped),
+            )?;
+            let ticks = mapped as *const u64;
+            let pair = (*ticks, *ticks.add(1));
+            timing
+                .readback
+                .Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+            pair
+        };
+        let gpu_freq = unsafe { self.queue.GetTimestampFrequency()? } as f64;
+        let (mut gpu_now, mut cpu_now) = (0u64, 0u64);
+        unsafe { self.queue.GetClockCalibration(&mut gpu_now, &mut cpu_now)? };
+        let qpc_freq = qpc_frequency() as f64;
+        // GPU ticks -> CPU QPC through one calibration pair.
+        let to_qpc = |t: u64| cpu_now as f64 - (gpu_now as f64 - t as f64) * qpc_freq / gpu_freq;
+        let ms = |a: f64, b: f64| (b - a) * 1000.0 / qpc_freq;
+        let submit = timing.submit_qpc.get() as f64;
+        let (start, end) = (to_qpc(start), to_qpc(end));
+        Ok(Some((ms(submit, start), ms(start, end), ms(end, now as f64))))
     }
 
     /// Signal the fence behind the submitted work and arm `fence_event` on it:
@@ -1147,9 +1249,14 @@ impl Converter12 {
             0,
         ];
 
+        let timing = self.timing.borrow();
         unsafe {
             self.allocator.Reset()?;
             self.list.Reset(&self.allocator, &self.pso)?;
+            if let Some(timing) = timing.as_ref() {
+                self.list
+                    .EndQuery(&timing.queries, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+            }
 
             transition(
                 &self.list,
@@ -1208,8 +1315,23 @@ impl Converter12 {
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                 D3D12_RESOURCE_STATE_COMMON,
             );
+            if let Some(timing) = timing.as_ref() {
+                self.list
+                    .EndQuery(&timing.queries, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                self.list.ResolveQueryData(
+                    &timing.queries,
+                    D3D12_QUERY_TYPE_TIMESTAMP,
+                    0,
+                    2,
+                    &timing.readback,
+                    0,
+                );
+            }
 
             self.list.Close()?;
+            if let Some(timing) = timing.as_ref() {
+                timing.submit_qpc.set(qpc_now());
+            }
             self.queue
                 .ExecuteCommandLists(&[Some(self.list.cast::<ID3D12CommandList>()?)]);
         }

@@ -1166,6 +1166,18 @@ class GpuConverter:
     def output_byte_size(self) -> int:
         return int(self._impl.output_byte_size)
 
+    def set_timing(self, on: bool) -> None:
+        """Diagnostics, off by default: GPU timestamps around each
+        :meth:`process` dispatch (see :meth:`last_timing`)."""
+        self._impl.set_timing(bool(on))
+
+    def last_timing(self):
+        """The last :meth:`process`, in ms: ``(wait, shader, notify)`` --
+        submission to the GPU starting the dispatch (the queued wait for the
+        capture device's copy of the frame, plus the queue), the shader itself,
+        and GPU end to this call. ``None`` while timing is off."""
+        return self._impl.last_timing()
+
     @property
     def output_resource_address(self) -> int:
         """``ID3D12Resource`` address — what DirectML and ONNX Runtime bind."""

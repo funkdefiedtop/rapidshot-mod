@@ -1023,6 +1023,29 @@ impl GpuConverter12 {
         Ok(inner.shared_output_handle())
     }
 
+    /// Diagnostics: GPU timestamps around each dispatch (off by default).
+    fn set_timing(&self, on: bool) -> PyResult<()> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("converter lock poisoned"))?;
+        inner
+            .set_timing(on)
+            .map_err(|e| PyRuntimeError::new_err(format!("timing setup failed: {e}")))
+    }
+
+    /// Last dispatch, ms: (submission -> GPU start, i.e. waiting for the
+    /// capture copy and the queue; shader; GPU end -> now), or None.
+    fn last_timing(&self) -> PyResult<Option<(f64, f64, f64)>> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("converter lock poisoned"))?;
+        inner
+            .last_timing()
+            .map_err(|e| PyRuntimeError::new_err(format!("timing readback failed: {e}")))
+    }
+
     #[getter]
     fn output_byte_size(&self) -> PyResult<u64> {
         let inner = self
