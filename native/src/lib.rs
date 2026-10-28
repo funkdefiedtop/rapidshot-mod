@@ -94,6 +94,34 @@ unsafe fn with_texture<T>(
     f(texture)
 }
 
+/// Block until an event armed by a native `*_submit` call fires; `None` means
+/// the GPU had already finished. Every armed event must be waited on: they
+/// are auto-reset and owned by the object that armed them, so one left
+/// signalled would end that object's next wait early.
+pub(crate) fn wait_armed(event: Option<isize>) {
+    if let Some(raw) = event {
+        unsafe {
+            windows::Win32::System::Threading::WaitForSingleObject(
+                windows::Win32::Foundation::HANDLE(raw as *mut core::ffi::c_void),
+                windows::Win32::System::Threading::INFINITE,
+            );
+        }
+    }
+}
+
+/// `wait_armed` with the GIL released, so other Python threads run while the
+/// GPU works. To the caller the method still blocks until the GPU is done.
+///
+/// Sound for the reason `wait_shared_fence` is: only the raw handle crosses
+/// into the detached closure. It belongs to the object whose method is
+/// running, and that object can be neither dropped nor -- being `unsendable`
+/// -- used from another thread before the method returns.
+fn wait_armed_detached(py: Python<'_>, event: Option<isize>) {
+    if event.is_some() {
+        py.detach(move || wait_armed(event));
+    }
+}
+
 /// Read a texture's description.
 unsafe fn texture_desc(pointer: usize) -> PyResult<D3D11_TEXTURE2D_DESC> {
     with_texture(pointer, |texture| {
@@ -611,18 +639,24 @@ impl TensorTransfer {
     ///
     /// Call `process()` first: this moves whatever is in the buffer, and a
     /// buffer never written is zeros rather than an error.
-    fn transfer(&self, converter: &GpuConverter12) -> PyResult<()> {
-        let inner = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("transfer lock poisoned"))?;
-        let source = converter
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("converter lock poisoned"))?;
-        inner
-            .transfer(&source)
-            .map_err(|e| PyRuntimeError::new_err(format!("tensor transfer failed: {e}")))
+    ///
+    /// Blocks until the copy is done, with the GIL released for the wait.
+    fn transfer(&self, py: Python<'_>, converter: &GpuConverter12) -> PyResult<()> {
+        let event = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| PyRuntimeError::new_err("transfer lock poisoned"))?;
+            let source = converter
+                .inner
+                .lock()
+                .map_err(|_| PyRuntimeError::new_err("converter lock poisoned"))?;
+            inner
+                .transfer_submit(&source)
+                .map_err(|e| PyRuntimeError::new_err(format!("tensor transfer failed: {e}")))?
+        };
+        wait_armed_detached(py, event);
+        Ok(())
     }
 
     /// Destination-side bytes. Verification only.
@@ -803,12 +837,15 @@ impl GpuConverter12 {
     /// texels of the captured surface — *not* frame coordinates; the Python
     /// layer translates a frame's region. Give at most one of the two. All
     /// regions run in one dispatch, into slots `0..len(regions)`.
+    ///
+    /// Blocks until the GPU is done, with the GIL released for the wait.
     #[pyo3(signature = (
         texture_ptr, scale=1.0, bias=0.0, bgr=false, *, source_id=0, crop=None, regions=None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn process(
         &self,
+        py: Python<'_>,
         texture_ptr: usize,
         scale: f32,
         bias: f32,
@@ -842,10 +879,10 @@ impl GpuConverter12 {
             height,
         })
         .collect();
-        unsafe {
+        let event = unsafe {
             with_texture(texture_ptr, |texture| {
                 inner
-                    .process(
+                    .process_submit(
                         texture,
                         source_id,
                         scale,
@@ -854,8 +891,11 @@ impl GpuConverter12 {
                         &rects,
                     )
                     .map_err(|e| PyRuntimeError::new_err(format!("D3D12 dispatch failed: {e}")))
-            })
-        }
+            })?
+        };
+        drop(inner);
+        wait_armed_detached(py, event);
+        Ok(())
     }
 
     /// Raw output bytes. Interpret with the `dtype` and `shape` properties.
@@ -1273,31 +1313,33 @@ impl CrossAdapterTransfer {
 
     /// Copy one frame across. Blocks until the source GPU has finished, so the
     /// frame is readable on the destination adapter when this returns.
+    ///
+    /// The GIL is released for the wait (~6 ms at 2560x1600): the copy is
+    /// submitted under it and only the armed event crosses into the wait.
     #[pyo3(signature = (texture_ptr, source_id=0))]
-    fn transfer(&self, texture_ptr: usize, source_id: u64) -> PyResult<()> {
-        let inner = self.lock()?;
-        // NOTE: this holds the GIL for the whole copy (~6 ms at 2560x1600).
-        // The wait is buried between COM calls on interior-mutable state, so
-        // it cannot be released the way `wait_shared_fence` does without
-        // restructuring resource lifetimes. Use `transfer_async` +
-        // `wait_shared_fence` when other Python threads need to run.
-        {
+    fn transfer(&self, py: Python<'_>, texture_ptr: usize, source_id: u64) -> PyResult<()> {
+        let event = {
+            let inner = self.lock()?;
             unsafe {
                 with_texture(texture_ptr, |texture| {
                     inner
-                        .transfer(texture, source_id)
+                        .transfer_submit(texture, source_id)
                         .map_err(|e| PyRuntimeError::new_err(format!("transfer failed: {e}")))
-                })
+                })?
             }
-        }
+        };
+        wait_armed_detached(py, event);
+        Ok(())
     }
 
     /// Copy only `(left, top, width, height)` of the frame to the start of the
-    /// shared heap; returns the row pitch in bytes. Blocks like `transfer`.
+    /// shared heap; returns the row pitch in bytes. Blocks like `transfer`,
+    /// with the GIL released for the wait.
     #[pyo3(signature = (texture_ptr, left, top, width, height, source_id=0))]
     #[allow(clippy::too_many_arguments)]
     fn transfer_region(
         &self,
+        py: Python<'_>,
         texture_ptr: usize,
         left: u32,
         top: u32,
@@ -1305,14 +1347,20 @@ impl CrossAdapterTransfer {
         height: u32,
         source_id: u64,
     ) -> PyResult<u32> {
-        let inner = self.lock()?;
-        unsafe {
-            with_texture(texture_ptr, |texture| {
-                inner
-                    .transfer_region(texture, source_id, left, top, width, height)
-                    .map_err(|e| PyRuntimeError::new_err(format!("region transfer failed: {e}")))
-            })
-        }
+        let (row_pitch, event) = {
+            let inner = self.lock()?;
+            unsafe {
+                with_texture(texture_ptr, |texture| {
+                    inner
+                        .transfer_region_submit(texture, source_id, left, top, width, height)
+                        .map_err(|e| {
+                            PyRuntimeError::new_err(format!("region transfer failed: {e}"))
+                        })
+                })?
+            }
+        };
+        wait_armed_detached(py, event);
+        Ok(row_pitch)
     }
 
     /// Transfer a frame and return a source-side copy of the same bytes, taken

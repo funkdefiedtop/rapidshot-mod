@@ -160,3 +160,48 @@ def motion():
             proc.wait(timeout=10)
         except Exception:
             proc.kill()
+
+
+@pytest.fixture
+def gil_progress():
+    """``gil_progress(work, calls=5)``: ticks a second Python thread made
+    while ``work()`` ran, counted across each call only.
+
+    The bar of ``test_wait_shared_fence_releases_the_gil``: any progress at
+    all falsifies a held GIL. The switch interval is raised for the count,
+    because the interpreter's forced switch (every 5 ms by default) would
+    otherwise hand the thread time between calls and let a held GIL pass.
+    The price is that each call that does release the GIL waits up to that
+    interval to get it back.
+    """
+
+    def run(work, calls=5):
+        stop = threading.Event()
+        ticks = [0]
+
+        def counter():
+            while not stop.is_set():
+                ticks[0] += 1
+
+        interval = sys.getswitchinterval()
+        sys.setswitchinterval(0.1)
+        worker = threading.Thread(target=counter, daemon=True)
+        worker.start()
+        progressed = 0
+        try:
+            deadline = time.monotonic() + 2
+            while ticks[0] == 0 and time.monotonic() < deadline:
+                time.sleep(0.001)
+            assert ticks[0] > 0, "the counter thread never started"
+            for _ in range(calls):
+                before = ticks[0]
+                work()
+                progressed += ticks[0] - before
+        finally:
+            sys.setswitchinterval(interval)
+            stop.set()
+            worker.join(timeout=2)
+        assert not worker.is_alive(), "the counter thread did not stop"
+        return progressed
+
+    return run

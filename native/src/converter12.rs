@@ -42,7 +42,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM,
 };
 use windows::Win32::Graphics::Dxgi::IDXGIResource1;
-use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
+use windows::Win32::System::Threading::CreateEventW;
 
 const GENERIC_ALL: u32 = 0x1000_0000;
 /// Size of the shader's `Params` cbuffer, in 32-bit values.
@@ -1025,19 +1025,30 @@ impl Converter12 {
     }
 
     fn wait_for_gpu(&self) -> windows::core::Result<()> {
+        crate::wait_armed(self.arm_gpu_wait()?);
+        Ok(())
+    }
+
+    /// Signal the fence behind the submitted work and arm `fence_event` on it:
+    /// the event to wait on, or `None` if the GPU already finished. The caller
+    /// waits on it (`crate::wait_armed`) before this converter is used again.
+    fn arm_gpu_wait(&self) -> windows::core::Result<Option<isize>> {
         let value = self.fence_value.get() + 1;
         self.fence_value.set(value);
         unsafe {
             self.queue.Signal(&self.fence, value)?;
             if self.fence.GetCompletedValue() < value {
                 self.fence.SetEventOnCompletion(value, self.fence_event)?;
-                WaitForSingleObject(self.fence_event, INFINITE);
+                return Ok(Some(self.fence_event.0 as isize));
             }
         }
-        Ok(())
+        Ok(None)
     }
 
-    /// Convert one captured frame. Same caching rules as `Preprocessor12`:
+    /// Convert one captured frame: submit the dispatch and return the armed
+    /// event (`arm_gpu_wait`) -- the output is complete once it has been
+    /// waited on. Split so the Python binding can release the GIL for the
+    /// wait. Same caching rules as `Preprocessor12`:
     /// the shared handle is opened per *texture*, not per frame, and the key
     /// pairs the pointer with the duplicator that produced it so a recycled
     /// COM address cannot silently reuse a stale resource.
@@ -1047,7 +1058,7 @@ impl Converter12 {
     /// whole surface. A rectangle reaching outside the surface is refused
     /// rather than clamped — a clamped crop is a plausible image of the wrong
     /// region.
-    pub fn process(
+    pub fn process_submit(
         &self,
         d3d11_texture: &ID3D11Texture2D,
         source_id: u64,
@@ -1055,7 +1066,7 @@ impl Converter12 {
         bias: f32,
         channel_order: u32,
         regions: &[Crop],
-    ) -> windows::core::Result<()> {
+    ) -> windows::core::Result<Option<isize>> {
         if regions.len() > self.batch as usize {
             return Err(windows::core::Error::new(
                 windows::Win32::Foundation::E_INVALIDARG,
@@ -1202,7 +1213,7 @@ impl Converter12 {
             self.queue
                 .ExecuteCommandLists(&[Some(self.list.cast::<ID3D12CommandList>()?)]);
         }
-        self.wait_for_gpu()
+        self.arm_gpu_wait()
     }
 
     fn open_texture(

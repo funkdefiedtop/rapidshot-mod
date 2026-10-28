@@ -560,7 +560,8 @@ class TensorTransfer:
         self._impl = native.require_feature("TensorTransfer")(converter._impl, **extra)
 
     def transfer(self) -> None:
-        """Copy the converter's current output across. Blocks until complete.
+        """Copy the converter's current output across. Blocks until complete;
+        other Python threads run while it waits.
 
         Call :meth:`GpuConverter.process` first: this moves whatever is in the
         buffer, and a buffer never written is zeros rather than an error.
@@ -959,6 +960,9 @@ class GpuConverter:
         The returned :class:`GpuTensor` is the *same object* every call while
         you hold it — it describes a buffer that is reused, so holding two of
         them would imply two results that do not exist.
+
+        Returns once the GPU has written the output; other Python threads run
+        while it waits.
         """
         if self._impl is None:
             raise RuntimeError("this GpuConverter is closed")

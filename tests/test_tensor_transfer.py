@@ -172,3 +172,28 @@ def test_repr_names_the_payload_and_both_adapters(transfer_pair):
     text = repr(transfer)
     assert "MB" in text
     assert transfer.destination in text
+
+
+# --------------------------------------------------------------------------
+# the GIL: a second Python thread runs while the GPU works
+# --------------------------------------------------------------------------
+
+
+def test_process_releases_the_gil_while_it_waits(transfer_pair, live_frame, gil_progress):
+    """``process()`` still returns only when the output is written, but the
+    fence wait no longer holds the interpreter: a capture thread waiting on
+    the GPU must not stop the thread that runs the model."""
+    converter, _ = transfer_pair
+    progressed = gil_progress(lambda: converter.process(live_frame))
+    assert progressed > 0, (
+        "another Python thread made no progress across five process() calls; "
+        "the fence wait is holding the GIL")
+
+
+def test_transfer_releases_the_gil_while_it_waits(transfer_pair, live_frame, gil_progress):
+    converter, transfer = transfer_pair
+    converter.process(live_frame)
+    progressed = gil_progress(transfer.transfer)
+    assert progressed > 0, (
+        "another Python thread made no progress across five transfer() calls; "
+        "the copy wait is holding the GIL")

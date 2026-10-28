@@ -730,7 +730,8 @@ class CrossAdapterTransfer:
         """Copy one frame across.
 
         Blocks until the source GPU has finished, so the frame is readable from
-        the destination adapter when this returns.
+        the destination adapter when this returns; other Python threads run
+        while it waits.
         """
         self._inner.transfer(_texture_address(frame), _source_id(frame))
 

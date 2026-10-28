@@ -714,12 +714,20 @@ impl Submitter {
 
     /// Submit what was recorded and block until the GPU has finished it.
     fn end_and_wait(&self) -> windows::core::Result<()> {
+        crate::wait_armed(self.end_and_arm()?);
+        Ok(())
+    }
+
+    /// `end_and_wait` without the blocking half: submit, and return the event
+    /// to wait on (`signal_and_arm_after_execute`). Split so the Python
+    /// binding can release the GIL for the wait.
+    fn end_and_arm(&self) -> windows::core::Result<Option<isize>> {
         unsafe {
             self.list.Close()?;
             self.queue
                 .ExecuteCommandLists(&[Some(self.list.cast::<ID3D12CommandList>()?)]);
         }
-        self.signal_and_wait_after_execute()
+        self.signal_and_arm_after_execute()
     }
 
     /// Attach a private completion marker to work that has already been sent.
@@ -729,16 +737,24 @@ impl Submitter {
     /// succeeds, so a failed fallback does not invent progress and deadlock a
     /// later wait.
     fn signal_and_wait_after_execute(&self) -> windows::core::Result<()> {
+        crate::wait_armed(self.signal_and_arm_after_execute()?);
+        Ok(())
+    }
+
+    /// Signal the private fence and arm `event` on it: the event to wait on,
+    /// or `None` if the GPU already finished. The caller waits on it
+    /// (`crate::wait_armed`) before this submitter records again.
+    fn signal_and_arm_after_execute(&self) -> windows::core::Result<Option<isize>> {
         let value = self.value.get() + 1;
         unsafe { self.queue.Signal(&self.fence, value)? };
         self.value.set(value);
         unsafe {
             if self.fence.GetCompletedValue() < value {
                 self.fence.SetEventOnCompletion(value, self.event)?;
-                WaitForSingleObject(self.event, INFINITE);
+                return Ok(Some(self.event.0 as isize));
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Preserve every object a submitted command list can still reference.
@@ -1251,25 +1267,30 @@ impl CrossAdapterTransfer {
         self.submission_health.get() == SubmissionHealth::Quarantined
     }
 
-    /// Copy one captured frame into the shared heap.
-    ///
-    /// Blocks until the source GPU has finished, so the frame is readable from
-    /// the destination adapter by the time this returns.
-    pub fn transfer(&self, texture: &ID3D11Texture2D, source_id: u64) -> windows::core::Result<()> {
+    /// Copy one captured frame into the shared heap: submit the copy and
+    /// return the event to wait on (`Submitter::end_and_arm`). The frame is
+    /// readable from the destination adapter once that wait is over; the
+    /// Python binding releases the GIL for it.
+    pub fn transfer_submit(
+        &self,
+        texture: &ID3D11Texture2D,
+        source_id: u64,
+    ) -> windows::core::Result<Option<isize>> {
         self.copy_from(texture, false, source_id)
     }
 
     /// Copy only `width` x `height` texels at `(left, top)` of the captured
-    /// frame into the start of the shared heap, and return the row pitch.
+    /// frame into the start of the shared heap; return the row pitch and the
+    /// event to wait on, like `transfer_submit`.
     ///
-    /// Blocks like `transfer`. The rows are laid out as `GetCopyableFootprints`
+    /// The rows are laid out as `GetCopyableFootprints`
     /// lays out a texture of the region's size: `row_pitch` bytes apart, the
     /// pitch padded to D3D12's 256-byte copy alignment. The heap is sized for
     /// the whole frame, so any region fits and moving or resizing it needs no
     /// rebuild. A consumer that converts on arrival then moves a region rather
     /// than a frame: a 432x576 BGRA region is under 1 MB against 8.3 MB at 1080p.
     #[allow(clippy::too_many_arguments)]
-    pub fn transfer_region(
+    pub fn transfer_region_submit(
         &self,
         texture: &ID3D11Texture2D,
         source_id: u64,
@@ -1277,7 +1298,7 @@ impl CrossAdapterTransfer {
         top: u32,
         width: u32,
         height: u32,
-    ) -> windows::core::Result<u32> {
+    ) -> windows::core::Result<(u32, Option<isize>)> {
         self.ensure_submission_usable()?;
         let mut desc = Default::default();
         unsafe { texture.GetDesc(&mut desc) };
@@ -1338,14 +1359,15 @@ impl CrossAdapterTransfer {
 
         let list = self.src.begin()?;
         unsafe { list.CopyTextureRegion(&destination, 0, 0, 0, &src_location, Some(&region)) };
-        let submitted = self.src.end_and_wait();
+        let submitted = self.src.end_and_arm();
 
+        // Before the copy has run, as in `copy_from`: these are extra
+        // references, the resources stay alive in the cache and in `self`.
         unsafe {
             core::mem::ManuallyDrop::drop(&mut destination.pResource);
             core::mem::ManuallyDrop::drop(&mut src_location.pResource);
         }
-        submitted?;
-        Ok(footprint.Footprint.RowPitch)
+        Ok((footprint.Footprint.RowPitch, submitted?))
     }
 
     /// Copy the texture into the shared heap, optionally mirroring the same
@@ -1398,12 +1420,14 @@ impl CrossAdapterTransfer {
         Ok(shared)
     }
 
+    /// Returns the event to wait on for the plain copy (`end_and_arm`); the
+    /// reference copy is verification only and still waits here.
     fn copy_from(
         &self,
         texture: &ID3D11Texture2D,
         with_reference: bool,
         source_id: u64,
-    ) -> windows::core::Result<()> {
+    ) -> windows::core::Result<Option<isize>> {
         self.ensure_submission_usable()?;
         let mut desc = Default::default();
         unsafe { texture.GetDesc(&mut desc) };
@@ -1421,7 +1445,7 @@ impl CrossAdapterTransfer {
         self.capture_order.order(&self.src.queue, texture)?;
 
         if with_reference {
-            return self.copy_via_snapshot(&shared);
+            return self.copy_via_snapshot(&shared).map(|()| None);
         }
 
         let mut src_location = D3D12_TEXTURE_COPY_LOCATION {
@@ -1435,10 +1459,12 @@ impl CrossAdapterTransfer {
 
         let list = self.src.begin()?;
         unsafe { list.CopyTextureRegion(&destination, 0, 0, 0, &src_location, None) };
-        let submitted = self.src.end_and_wait();
+        let submitted = self.src.end_and_arm();
 
         // pResource is a ManuallyDrop, so every reference is released by hand
-        // rather than at end of scope.
+        // rather than at end of scope. Safe before the copy has run: these are
+        // extra references -- the capture surface stays in `cached_shared` and
+        // the buffer in `self`, and neither changes until the caller has waited.
         unsafe {
             core::mem::ManuallyDrop::drop(&mut destination.pResource);
             core::mem::ManuallyDrop::drop(&mut src_location.pResource);
@@ -1472,7 +1498,7 @@ impl CrossAdapterTransfer {
         texture: &ID3D11Texture2D,
         source_id: u64,
     ) -> windows::core::Result<Vec<u8>> {
-        self.copy_from(texture, true, source_id)?;
+        crate::wait_armed(self.copy_from(texture, true, source_id)?);
         map_to_vec(&self.src_readback, self.total_bytes)
     }
 
@@ -2510,17 +2536,18 @@ impl TensorTransfer {
         })
     }
 
-    /// Copy the converter's current output across. Blocks until the source GPU
-    /// has finished, so the tensor is readable on the destination adapter when
-    /// this returns.
+    /// Copy the converter's current output across: submit the copy and return
+    /// the event to wait on (`Submitter::end_and_arm`). The tensor is readable
+    /// on the destination adapter once that wait is over; the Python binding
+    /// releases the GIL for it.
     ///
     /// The caller is responsible for having run `process()` first: this copies
     /// whatever is in the buffer, and a buffer that was never written is zeros
     /// rather than an error.
-    pub fn transfer(
+    pub fn transfer_submit(
         &self,
         converter: &crate::converter12::Converter12,
-    ) -> windows::core::Result<()> {
+    ) -> windows::core::Result<Option<isize>> {
         if converter.output_byte_size() != self.size_bytes {
             return Err(windows::core::Error::new(
                 windows::Win32::Foundation::E_INVALIDARG,
@@ -2536,7 +2563,7 @@ impl TensorTransfer {
         unsafe {
             list.CopyBufferRegion(&self.shared_src, 0, converter.output(), 0, self.size_bytes)
         };
-        self.src.end_and_wait()
+        self.src.end_and_arm()
     }
 
     /// Read the destination-side buffer back to the CPU. Verification only: it

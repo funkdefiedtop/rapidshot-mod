@@ -572,6 +572,28 @@ def test_wait_shared_fence_releases_the_gil(live_capture):
         "wait_shared_fence is holding the GIL")
 
 
+@pytest.mark.parametrize("call", ["transfer", "transfer_region"])
+def test_blocking_transfers_release_the_gil(live_capture, gil_progress, call):
+    """``transfer()`` and ``transfer_region()`` still return only when the copy
+    is done, but the wait no longer holds the interpreter -- the restructuring
+    the old note on ``transfer`` called for: submit under the GIL, wait on
+    the armed event without it."""
+    frame = _grab(live_capture)
+    if frame is None:
+        pytest.skip("no frame captured -- the screen must be changing")
+    try:
+        transfer = native.cross_adapter_transfer(frame)
+        if call == "transfer":
+            progressed = gil_progress(lambda: transfer.transfer(frame))
+        else:
+            progressed = gil_progress(lambda: transfer.transfer_region(frame, 0, 0, 64, 64))
+    finally:
+        frame.release()
+    assert progressed > 0, (
+        f"another Python thread made no progress across five {call}() calls; "
+        "the copy wait is holding the GIL")
+
+
 def test_the_cache_key_includes_the_source_id(live_capture):
     """A texture address alone is not an identity.
 
